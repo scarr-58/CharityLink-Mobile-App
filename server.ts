@@ -436,21 +436,62 @@ function tierFor(total: number) {
 // Calls Gemini when GEMINI_API_KEY is configured; returns null otherwise so
 // callers can fall back to a deterministic local generator (keeps the demo
 // working with no API key).
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(
+      () => reject(Object.assign(new Error(`timed out after ${ms}ms`), { status: "timeout" })),
+      ms
+    );
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); }
+    );
+  });
+}
+
 async function callGemini(prompt: string): Promise<string | null> {
   const key = process.env.GEMINI_API_KEY;
   if (!key || key === "MY_GEMINI_API_KEY") return null;
+
+  let ai: any;
   try {
     const { GoogleGenAI } = await import("@google/genai");
-    const ai = new GoogleGenAI({ apiKey: key });
-    const resp: any = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: prompt
-    });
-    return resp?.text ?? null;
-  } catch (err) {
-    console.error("Gemini call failed, using fallback:", err);
+    ai = new GoogleGenAI({ apiKey: key });
+  } catch (err: any) {
+    console.error("Gemini setup failed:", String(err?.message ?? err).slice(0, 300));
     return null;
   }
+
+  const started = Date.now();
+  const CALL_TIMEOUT_MS = 8000;   // max wait for one request
+  const DEADLINE_MS = 25000;      // max total, safely under the app's 40s limit
+  const models = ["gemini-flash-latest", "gemini-flash-lite-latest"];
+
+  for (const model of models) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      if (Date.now() - started > DEADLINE_MS - CALL_TIMEOUT_MS) {
+        console.error("Gemini deadline reached, using fallback replies");
+        return null;
+      }
+      try {
+        const resp: any = await withTimeout(
+          ai.models.generateContent({ model, contents: prompt }),
+          CALL_TIMEOUT_MS
+        );
+        const text = resp?.text;
+        if (text) return text;
+        break; // empty reply: try the next model
+      } catch (err: any) {
+        console.error(
+          `Gemini call failed (${model}, try ${attempt}): status ${err?.status ?? "?"} ${String(err?.message ?? err).slice(0, 200)}`
+        );
+        const busy = err?.status === 503 || err?.status === 429;
+        if (!busy) break; // timeout, fetch failed, 404: go to the next model
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
+  }
+  return null;
 }
 
 function localCampaignCopy(idea: string, category: string, org: string) {
@@ -842,6 +883,32 @@ async function startServer() {
     res.json(db.campaigns[idx]);
   });
 
+    // Verify / unverify a campaign (admin only).
+  app.put("/api/campaigns/:id/verify", async (req, res) => {
+    const campaignId = Number(req.params.id);
+    const requester = await resolveRequester(req);
+    if (!requester || requester.role !== "admin") {
+      return res.status(403).json({ error: "Administrator access required." });
+    }
+    const verified = Boolean(req.body?.verified);
+
+    try {
+      if (isUsingMySQL && pool) {
+        const [result]: any = await pool.query("UPDATE campaigns SET verified = ? WHERE id = ?", [verified ? 1 : 0, campaignId]);
+        if (!result.affectedRows) return res.status(404).json({ error: "Campaign not found." });
+        return res.json({ success: true, id: campaignId, verified });
+      }
+    } catch (err) {
+      console.error("MySQL update error in PUT /api/campaigns/:id/verify:", err);
+    }
+
+    const db = loadDB();
+    const idx = db.campaigns.findIndex(c => c.id === campaignId);
+    if (idx === -1) return res.status(404).json({ error: "Campaign not found." });
+    db.campaigns[idx].verified = verified;
+    saveDB(db);
+    res.json({ success: true, id: campaignId, verified });
+  });
   // Log in user
   app.post("/api/auth/login", async (req, res) => {
     const { email, password } = req.body;
@@ -1175,7 +1242,153 @@ async function startServer() {
     }
     res.json(localImpact(amt, campaignTitle, category || ""));
   });
+    // --- FRAUD / ANOMALY FLAGS (admin only) ---
+  app.get("/api/admin/fraud-flags", async (req, res) => {
+    const requester = await resolveRequester(req);
+    if (!requester || requester.role !== "admin") {
+      return res.status(403).json({ error: "Administrator access required." });
+    }
+    const { campaigns, contributions } = await snapshot();
+    const flags: Array<{ id: string; severity: string; type: string; title: string; detail: string }> = [];
+    const kes = (n: number) => `KES ${Number(n).toLocaleString()}`;
 
+    // 1. Unusually large donations
+    for (const c of contributions) {
+      if (c.amount >= 100000) {
+        flags.push({
+          id: `large_${c.id}`, severity: "high", type: "Large donation",
+          title: `${kes(c.amount)} from ${c.donorName}`,
+          detail: `Single donation to "${c.campaignTitle}" via ${c.paymentMethod}. Verify the source of funds.`
+        });
+      }
+    }
+
+    // 2. Rapid bursts: 3+ donations from one donor within 10 minutes
+    const byDonor: Record<string, number[]> = {};
+    for (const c of contributions) {
+      const key = (c.donorEmail || "").toLowerCase();
+      const t = new Date(c.timestamp).getTime();
+      if (!key || isNaN(t)) continue;
+      (byDonor[key] = byDonor[key] || []).push(t);
+    }
+    for (const [email, times] of Object.entries(byDonor)) {
+      times.sort((a, b) => a - b);
+      for (let i = 0; i + 2 < times.length; i++) {
+        if (times[i + 2] - times[i] <= 10 * 60 * 1000) {
+          flags.push({
+            id: `burst_${email}`, severity: "medium", type: "Rapid donations",
+            title: `3+ donations in 10 minutes`,
+            detail: `${email} made several donations in a very short time. This can indicate card testing or automated activity.`
+          });
+          break;
+        }
+      }
+    }
+
+    // 3. Campaign owners donating to their own campaigns
+    for (const c of contributions) {
+      const camp = campaigns.find(k => k.id === c.campaignId);
+           if (camp?.ownerEmail && camp.ownerEmail.toLowerCase() === (c.donorEmail || "").toLowerCase()) {
+        flags.push({
+          id: `self_${c.id}`, severity: "high", type: "Self-donation",
+          title: `Owner funded own campaign`,
+          detail: `${c.donorEmail} gave ${kes(c.amount)} to their own campaign "${c.campaignTitle}". This can inflate progress artificially.`
+        });
+      }
+    }
+
+    // 4. Campaigns well past their target, or unverified
+    for (const k of campaigns) {
+      if (k.raised > k.target * 1.1) {
+        flags.push({
+          id: `over_${k.id}`, severity: "low", type: "Over target",
+          title: `${k.title}`,
+          detail: `Raised ${kes(k.raised)} against a ${kes(k.target)} target (${Math.round((k.raised / k.target) * 100)}%). Confirm how the extra funds will be used.`
+        });
+      }
+      if (!k.verified) {
+        flags.push({
+          id: `unver_${k.id}`, severity: "medium", type: "Unverified campaign",
+          title: `${k.title}`,
+          detail: `This campaign is still accepting donations without verification.`
+        });
+      }
+    }
+
+    // 5. Large anonymous donations
+    for (const c of contributions) {
+      if ((c.donorEmail || "").toLowerCase() === "anonymous@charitylink.org" && c.amount >= 20000) {
+        flags.push({
+          id: `anon_${c.id}`, severity: "medium", type: "Anonymous donation",
+          title: `${kes(c.amount)} from an anonymous donor`,
+          detail: `Given to "${c.campaignTitle}". No donor identity is on record.`
+        });
+      }
+    }
+
+    const order: Record<string, number> = { high: 0, medium: 1, low: 2 };
+    flags.sort((a, b) => order[a.severity] - order[b.severity]);
+
+    // Optional AI summary (falls back to a plain sentence without a Gemini key)
+    let summary = flags.length
+      ? `${flags.length} item(s) need review: ${flags.filter(f => f.severity === "high").length} high, ${flags.filter(f => f.severity === "medium").length} medium, ${flags.filter(f => f.severity === "low").length} low.`
+      : "No suspicious activity found.";
+    if (flags.length) {
+      const ai = await callGemini(
+        `You are a fraud analyst for a charity donation platform. In at most 2 plain-text sentences, summarise the main risks in these flags and what the admin should check first:\n` +
+        flags.slice(0, 15).map(f => `- [${f.severity}] ${f.type}: ${f.title}. ${f.detail}`).join("\n")
+      );
+      if (ai && ai.trim()) summary = ai.trim();
+    }
+
+    res.json({ flags, summary });
+  });
+  // --- AI: CHAT ASSISTANT (mobile app) ---
+  app.post("/api/ai/chat", async (req, res) => {
+    const { message, email } = req.body as { message?: string; email?: string };
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: "Message is required." });
+    }
+    const { campaigns, contributions } = await snapshot();
+    const mine = email
+      ? contributions.filter(c => (c.donorEmail || "").toLowerCase() === String(email).trim().toLowerCase())
+      : [];
+
+    const campaignLines = campaigns.map(c =>
+      `- ${c.title} (${c.category}, ${c.org}): KES ${c.raised} of ${c.target}, ${c.donors} donors, ${c.verified ? "verified" : "unverified"}. Funds use: ${c.usage}`
+    ).join("\n");
+    const myLines = mine.length
+      ? mine.map(c => `- KES ${c.amount} to ${c.campaignTitle} on ${(c.timestamp || "").slice(0, 10)} via ${c.paymentMethod}`).join("\n")
+      : "No donations yet.";
+
+       const prompt =
+      `You are the assistant inside the CharityLink app, a transparent charity donation platform in Kenya. ` +
+      `Answer ONLY from the data below. If the answer is not in the data, say you don't have that information. ` +
+      `Reply directly, in a natural, conversational tone, like a knowledgeable person texting. ` +
+      `Never open with a greeting such as "Hello" or "Hi", and never introduce yourself. ` +
+      `Only greet the user back if their whole message is just a greeting. ` +
+      `Keep it under 60 words, plain text, no markdown.\n\n` +
+      `CAMPAIGNS:\n${campaignLines}\n\nTHIS USER'S DONATIONS:\n${myLines}\n\nQUESTION: ${message}`;
+          const raw = await callGemini(prompt);
+
+    if (raw && raw.trim()) return res.json({ reply: raw.trim(), source: "ai" });
+
+    // Fallback when no Gemini key is configured
+    const q = message.toLowerCase();
+    let reply: string;
+       if (/\b(my|i|i've|me)\b/.test(q) && /(donat|gave|given|give|contribut)/.test(q)) {
+      const total = mine.reduce((s, c) => s + c.amount, 0);
+      reply = mine.length
+        ? `You have made ${mine.length} donation(s) totalling KES ${total.toLocaleString()}. Your latest went to ${mine[mine.length - 1].campaignTitle}.`
+        : "You have not made any donations yet.";
+    } else if (q.includes("verified")) {
+      const v = campaigns.filter(c => c.verified);
+      reply = `${v.length} of ${campaigns.length} campaigns are verified: ${v.map(c => c.title).join("; ")}.`;
+    } else {
+      reply = `CharityLink has ${campaigns.length} active campaigns: ${campaigns.map(c => c.title).join("; ")}. Ask about a campaign or your donations.`;
+    }
+    res.json({ reply, source: "template" });
+  });
   // Submit donation
   app.post("/api/campaigns/:id/donate", async (req, res) => {
     const campaignId = Number(req.params.id);
@@ -1370,8 +1583,8 @@ async function startServer() {
         PartyB: shortCode,
         PhoneNumber: normalizedPhone,
         CallBackURL: callbackUrl,
-        AccountReference: reference,
-        TransactionDesc: 'CharityLink Donation'
+        AccountReference: 'CharityLink',
+        TransactionDesc: 'CharityLink'
       };
 
       const stkPushUrl = `${baseUrl}/mpesa/stkpush/v1/processrequest`;
@@ -1526,6 +1739,7 @@ const records = db.contributions.filter((c: Contribution) => c.donorEmail.toLowe
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
+               allowedHosts: [".ngrok-free.dev", ".ngrok-free.app", ".ngrok.io"], 
         // The server writes its JSON data files into the project root on every
         // donation/registration. Without this, Vite's file watcher would detect
         // those writes and trigger a full page reload — wiping in-memory React
